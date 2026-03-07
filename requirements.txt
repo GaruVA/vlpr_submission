@@ -1,5 +1,59 @@
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-requests>=2.30.0
-flake8>=6.0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt
+# Multi-Point Spatial-Temporal Verification Framework
+# BSc. Software Engineering FYP — Plymouth University
+# Student: Garuka Assalaarachchi | Index: 10952592
+#
+# Sprint 3: Full rewrite with pinned versions for Viva stability.
+#
+# Notes:
+#   - All versions are pinned (==) to guarantee reproducible environments.
+#     An unpinned `>=` constraint risks pulling breaking changes between
+#     the development environment and the Viva demonstration machine.
+#
+#   - Graph library omitted intentionally. The FacilityGraph (src/spatial.py)
+#     is a pure-Python adjacency dict implementation, demonstrating explicit
+#     command of graph data structures — a deliberate academic decision.
+#
+#   - Linting tools (e.g. pep8 checkers) are development-only and are
+#     excluded from this runtime requirements file. Install them separately
+#     in development environments only.
+#
+#   - torch and torchvision are listed but installation should follow the
+#     official PyTorch matrix at https://pytorch.org/get-started/locally/
+#     to match the local CUDA version (tested on CUDA 11.8 / RTX 3060).
+#     Override with the appropriate +cu118 index URL if needed:
+#       pip install torch==2.2.1+cu118 torchvision==0.17.1+cu118 \
+#                   --index-url https://download.pytorch.org/whl/cu118
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core Computer Vision ──────────────────────────────────────────────────────
+# OpenCV: plate detection preprocessing, frame capture, display, CLAHE.
+# Provides enhance_plate_contrast() dependencies (cv2.cvtColor, cv2.createCLAHE).
+opencv-python==4.9.0.80
+
+# ── Deep Learning Framework ───────────────────────────────────────────────────
+# PyTorch: backbone for YOLOv8 inference and CRNN character recognition.
+# See CUDA note above for GPU-accelerated installation.
+torch==2.2.1
+torchvision==0.17.1
+
+# ── Object Detection & OCR ───────────────────────────────────────────────────
+# Ultralytics YOLOv8: plate localisation (Layer 1) and character
+# classification (Layer 2 perception input).
+# Pinned to 8.1.47 — the version used for all model training and evaluation
+# reported in the Interim Report (87.3% detection precision, 12ms inference).
+ultralytics==8.1.47
+
+# ── Numerical Computing ───────────────────────────────────────────────────────
+numpy==1.26.4
+
+# ── Scientific Computing ─────────────────────────────────────────────────────
+# scipy: available for Hungarian algorithm (linear_sum_assignment) if the
+# tracker is upgraded from greedy IoU matching to optimal assignment in a
+# future sprint. Included now as the dependency is already identified.
+scipy==1.13.0
+
+# ── HTTP / REST API ───────────────────────────────────────────────────────────
+# requests: async CDL REST API submission (database.py Channel 2).
+requests==2.31.0
