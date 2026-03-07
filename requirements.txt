@@ -57,3 +57,6 @@ scipy==1.13.0
 # ── HTTP / REST API ───────────────────────────────────────────────────────────
 # requests: async CDL REST API submission (database.py Channel 2).
 requests==2.31.0
+
+# ── Web Dashboard (Sprint 4) ─────────────────────────────────────────────────
+flask==3.1.2

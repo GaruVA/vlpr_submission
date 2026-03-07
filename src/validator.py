@@ -298,53 +298,43 @@ class SriLankanPlateValidator:
 
         return prev_row[n]
 
-    def find_best_match(self, ocr_text: str) -> tuple:
+    def find_best_match(
+        self,
+        ocr_text: str,
+        registered_plates: 'Optional[list]' = None,
+    ) -> tuple:
         """
-        Find the closest match in REGISTERED_VEHICLES using the LPM-MLED algorithm.
+        Find the closest match in the vehicle registry using the LPM-MLED algorithm.
 
-        Fulfils FR-03 (Weighted Fuzzy Validation) from Interim Report §3.1 and
-        the database lookup step described in §6.4:
-        "The cleaned string is then matched against the employee vehicle database
-        using the Weighted Homoglyph Matching algorithm, which applies optical
-        confusion penalties to produce a match confidence score."
+        Sprint 4 Change (backward-compatible):
+          registered_plates replaces the hardcoded REGISTERED_VEHICLES frozenset.
+          When called from the CV pipeline, pass db_manager.get_registered_plates()
+          to use the live SQLite-managed registry from the dashboard CRUD interface.
 
-        In production, this iterates over live PostgreSQL records.
-        In the demo, it iterates over the REGISTERED_VEHICLES frozenset.
-
-        Args:
-            ocr_text: The plate string from the recognition pipeline (may
-                      contain OCR errors e.g. 'CA8-1234' for 'CAB-1234').
+          When registered_plates=None (all Sprint 1-3 tests), falls back to
+          REGISTERED_VEHICLES frozenset. Fully backward compatible.
 
         Returns:
-            (matched_plate, distance):
-              matched_plate — the best-matching registered plate string,
-                              or None if no match within threshold.
-              distance      — the LPM-MLED score (lower = better match).
-
-        Example:
-            find_best_match('CA8-1234')
-            → ('CAB-1234', 0.1)   # B/8 confusion = 0.1 penalty → accepted
-
-            find_best_match('ZZZ-9999')
-            → (None, 2.4)         # no registered vehicle close enough → rejected
+            (matched_plate, distance): matched_plate is None if distance > threshold.
         """
         if not ocr_text or ocr_text in ("No text detected", "Reading..."):
             return (None, float('inf'))
 
+        # Sprint 4: live DB list if provided, else frozenset fallback.
+        plate_source = registered_plates if registered_plates is not None \
+                       else REGISTERED_VEHICLES
+
         best_plate:    Optional[str] = None
         best_distance: float = float('inf')
 
-        for registered_plate in REGISTERED_VEHICLES:
+        for registered_plate in plate_source:
             distance = self.lpm_mled(ocr_text, registered_plate)
             if distance < best_distance:
                 best_distance = distance
                 best_plate    = registered_plate
 
-        # Apply the acceptance threshold from Interim Report §6.4.
         if best_distance <= LPM_MLED_THRESHOLD:
             return (best_plate, best_distance)
-
-        # Distance exceeds threshold — no reliable match found.
         return (None, best_distance)
 
     # ──────────────────────────────────────────────────────────────────────────

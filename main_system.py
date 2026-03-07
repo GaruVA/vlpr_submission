@@ -165,7 +165,9 @@ class CameraStream:
 
     def __init__(self, source: str) -> None:
         self.source  = source
-        self.cap     = cv2.VideoCapture(source)
+        # Integer index required for local webcams; keep string for URLs/paths.
+        _cap_source  = int(source) if source.lstrip('-').isdigit() else source
+        self.cap     = cv2.VideoCapture(_cap_source, cv2.CAP_MSMF)
 
         if source.startswith(('rtsp://', 'http://')):
             # Minimise OS-level buffer depth — we only ever want the latest frame.
@@ -638,6 +640,15 @@ def run_enhanced_plate_detection() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        CONFIG['VIDEO_SOURCE'] = sys.argv[1]
+    import argparse as _ap
+    _parser = _ap.ArgumentParser(description="VLPR Production Pipeline")
+    _parser.add_argument("--source",    default=None,  help="Camera index (1/2) or RTSP URL")
+    _parser.add_argument("--device",    default=None,  help="Camera ID logged to DB (e.g. 01, 02)")
+    _parser.add_argument("--direction", default=None,  choices=["I", "O"], help="I=entry O=exit")
+    _args = _parser.parse_args()
+
+    if _args.source    is not None: CONFIG['VIDEO_SOURCE'] = _args.source
+    if _args.device    is not None: CONFIG['DEVICE']       = _args.device
+    if _args.direction is not None: CONFIG['IN_OUT']       = _args.direction
+
     run_enhanced_plate_detection()

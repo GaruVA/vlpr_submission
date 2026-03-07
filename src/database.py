@@ -129,6 +129,21 @@ class DatabaseManager:
             ON fraud_events (plate_number);
         CREATE INDEX IF NOT EXISTS idx_fraud_type
             ON fraud_events (violation_type);
+
+        -- Registered vehicle database (Sprint 4).
+        -- Replaces the hardcoded REGISTERED_VEHICLES frozenset in validator.py.
+        -- Managed via the web dashboard CRUD interface.
+        CREATE TABLE IF NOT EXISTS registered_vehicles (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_number    TEXT    NOT NULL UNIQUE,
+            owner_name      TEXT    NOT NULL DEFAULT '',
+            vehicle_type    TEXT    NOT NULL DEFAULT 'Car',
+            department      TEXT    NOT NULL DEFAULT '',
+            registered_date TEXT    NOT NULL,
+            is_active       INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_vehicles_plate
+            ON registered_vehicles (plate_number);
     """
 
     def __init__(
@@ -306,6 +321,163 @@ class DatabaseManager:
         stats = self.stats.copy()
         stats['queue_depth'] = self.insert_queue.qsize()
         return stats
+
+    # ── Registered Vehicle Registry — Sprint 4 ──────────────────────────────
+
+    def seed_registered_vehicles(self) -> None:
+        """
+        Populate the registered_vehicles table from the hardcoded
+        REGISTERED_VEHICLES frozenset if the table is currently empty.
+
+        Called once at dashboard startup. Idempotent — subsequent calls
+        are no-ops. Ensures the dashboard has data to display immediately
+        without requiring a manual import step.
+        """
+        try:
+            with self._sqlite_lock:
+                with sqlite3.connect(self.sqlite_db_path) as conn:
+                    count = conn.execute(
+                        'SELECT COUNT(*) FROM registered_vehicles'
+                    ).fetchone()[0]
+                    if count > 0:
+                        return  # Already seeded — idempotent.
+
+                    # Import lazily to avoid circular dependency.
+                    from src.validator import REGISTERED_VEHICLES
+                    today = datetime.now().strftime('%Y-%m-%d')
+
+                    # Departmental assignments for seeded vehicles (demo data).
+                    dept_map = {
+                        'WP': 'Operations',  'SP': 'Logistics',
+                        'NW': 'Engineering', 'EP': 'Security',
+                        'NC': 'Finance',     'SG': 'Administration',
+                        'CAB': 'Management', 'UVA': 'Maintenance',
+                        'SAB': 'IT',         'NCP': 'HR',
+                    }
+
+                    rows = []
+                    for plate in sorted(REGISTERED_VEHICLES):
+                        prefix = plate.split('-')[0]
+                        dept   = dept_map.get(prefix, 'General')
+                        rows.append((plate, f'Employee ({prefix})', 'Car', dept, today, 1))
+
+                    conn.executemany(
+                        """INSERT OR IGNORE INTO registered_vehicles
+                           (plate_number, owner_name, vehicle_type,
+                            department, registered_date, is_active)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        rows,
+                    )
+                    conn.commit()
+                    print(f"    Seeded {len(rows)} vehicles into registered_vehicles table.")
+        except sqlite3.Error as e:
+            print(f"⚠️  Vehicle seed error: {e}")
+
+    def get_registered_plates(self) -> list:
+        """
+        Return the list of ACTIVE plate number strings from the database.
+
+        Called by the CV pipeline at detection-commit time to pass a live
+        set of registered plates to SriLankanPlateValidator.find_best_match().
+        This replaces the hardcoded REGISTERED_VEHICLES frozenset.
+        """
+        try:
+            with sqlite3.connect(self.sqlite_db_path) as conn:
+                rows = conn.execute(
+                    "SELECT plate_number FROM registered_vehicles WHERE is_active=1"
+                ).fetchall()
+                return [r[0] for r in rows]
+        except sqlite3.Error as e:
+            print(f"⚠️  get_registered_plates error: {e}")
+            return []
+
+    def get_all_vehicles(self) -> list:
+        """Return all registered_vehicles rows as list of dicts (for dashboard)."""
+        try:
+            with sqlite3.connect(self.sqlite_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """SELECT id, plate_number, owner_name, vehicle_type,
+                              department, registered_date, is_active
+                       FROM registered_vehicles
+                       ORDER BY plate_number"""
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            print(f"⚠️  get_all_vehicles error: {e}")
+            return []
+
+    def add_vehicle(
+        self,
+        plate_number: str,
+        owner_name:   str,
+        vehicle_type: str,
+        department:   str,
+    ) -> tuple:
+        """
+        INSERT a new registered vehicle.
+
+        Returns:
+            (success: bool, message: str)
+        """
+        try:
+            with self._sqlite_lock:
+                with sqlite3.connect(self.sqlite_db_path) as conn:
+                    conn.execute(
+                        """INSERT INTO registered_vehicles
+                           (plate_number, owner_name, vehicle_type,
+                            department, registered_date, is_active)
+                           VALUES (?, ?, ?, ?, ?, 1)""",
+                        (
+                            plate_number.strip().upper(),
+                            owner_name.strip(),
+                            vehicle_type.strip(),
+                            department.strip(),
+                            datetime.now().strftime('%Y-%m-%d'),
+                        )
+                    )
+                    conn.commit()
+                    return (True, f"Vehicle {plate_number} registered successfully.")
+        except sqlite3.IntegrityError:
+            return (False, f"Plate {plate_number} already exists in the registry.")
+        except sqlite3.Error as e:
+            return (False, f"Database error: {e}")
+
+    def update_vehicle(
+        self,
+        vehicle_id:   int,
+        owner_name:   str,
+        vehicle_type: str,
+        department:   str,
+        is_active:    int,
+    ) -> tuple:
+        """UPDATE a vehicle record. Returns (success, message)."""
+        try:
+            with self._sqlite_lock:
+                with sqlite3.connect(self.sqlite_db_path) as conn:
+                    conn.execute(
+                        """UPDATE registered_vehicles
+                           SET owner_name=?, vehicle_type=?, department=?, is_active=?
+                           WHERE id=?""",
+                        (owner_name, vehicle_type, department, int(is_active), vehicle_id)
+                    )
+                    conn.commit()
+                    return (True, "Vehicle updated successfully.")
+        except sqlite3.Error as e:
+            return (False, f"Database error: {e}")
+
+    def delete_vehicle(self, vehicle_id: int) -> tuple:
+        """Hard-delete a vehicle record. Returns (success, message)."""
+        try:
+            with self._sqlite_lock:
+                with sqlite3.connect(self.sqlite_db_path) as conn:
+                    conn.execute(
+                        "DELETE FROM registered_vehicles WHERE id=?", (vehicle_id,)
+                    )
+                    conn.commit()
+                    return (True, "Vehicle removed from registry.")
+        except sqlite3.Error as e:
+            return (False, f"Database error: {e}")
 
     def query_recent_access_log(self, limit: int = 20) -> list:
         """
