@@ -31,6 +31,8 @@ import sys
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional
+import threading
+import time
 
 from flask import (Flask, Response, flash, jsonify, redirect,
                    render_template_string, request, session, url_for)
@@ -77,8 +79,8 @@ USERS: dict = {
 
 # ── Role permission matrix ────────────────────────────────────────────────────
 PERMISSIONS: dict = {
-    'admin':    {'overview', 'vehicles', 'fraud_feed', 'access_log', 'health', 'users'},
-    'security': {'overview', 'vehicles', 'fraud_feed', 'access_log'},
+    'admin':    {'overview', 'vehicles', 'fraud_feed', 'access_log', 'health', 'users', 'cctv'},
+    'security': {'overview', 'vehicles', 'fraud_feed', 'access_log', 'cctv'},
     'finance':  {'overview', 'access_log', 'reports'},
 }
 
@@ -94,10 +96,6 @@ def get_db() -> DatabaseManager:
     global _db_manager
     if _db_manager is None:
         _db_manager = DatabaseManager(
-            base_url  = 'http://localhost',
-            cam_code  = 'DASHBOARD',
-            device    = '00',
-            in_out    = 'N',
             sqlite_db_path = _db_path,
         )
         _db_manager.seed_registered_vehicles()
@@ -109,6 +107,331 @@ def raw_db() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sprint 6: VideoStreamManager — headless dual-camera MJPEG pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+import io as _io
+import cv2 as _cv2
+import numpy as _np
+
+_GATE_KEYS  = ('gate_a', 'gate_b')
+_GATE_NAMES = ('GATE A', 'GATE B')
+
+# BGR colour constants for OpenCV overlay drawing
+_COL_GREEN  = (0, 220, 80)
+_COL_RED    = (0, 60, 220)
+_COL_ORANGE = (30, 140, 240)
+_COL_WHITE  = (220, 230, 255)
+_COL_YELLOW = (50, 230, 230)
+
+def _make_placeholder(message: str = 'NO SIGNAL') -> bytes:
+    """Return a JPEG-encoded 640×480 dark placeholder frame."""
+    img = _np.full((480, 640, 3), 22, dtype=_np.uint8)
+    _cv2.rectangle(img, (0, 0), (639, 479), (40, 60, 80), 2)
+    _cv2.putText(img, message, (int(640/2 - len(message)*9), 245),
+                 _cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 120, 150), 2)
+    ok, buf = _cv2.imencode('.jpg', img, [_cv2.IMWRITE_JPEG_QUALITY, 70])
+    return bytes(buf) if ok else b''
+
+
+class VideoStreamManager:
+    """
+    Single-threaded dual-camera pipeline for the Flask MJPEG stream.
+
+    Runs the full VLPR pipeline (YOLOv8 plate detection → CLAHE enhancement
+    → character recognition → PlateTracker consensus → STC fraud check) in a
+    single background daemon thread. Processing follows the exact sequential
+    gate loop from research_demo.py — Gate A is processed, then Gate B — so
+    the shared SpatialVerifier is never accessed concurrently.
+
+    Annotated frames (BGR numpy arrays) are JPEG-encoded and stored in
+    frame_buffers[gate_key]. Each buffer is protected by a threading.Lock
+    so the Flask MJPEG generator thread can read safely.
+
+    Thread model:
+      Writer: _run() daemon thread  — calls _process_frame(), updates buffers
+      Readers: Flask /stream/ generators — read latest JPEG under lock
+
+    cv2.imshow() and cv2.waitKey() are NEVER called — fully headless.
+    """
+
+    # Camera index CLI override: GATE_A_CAM / GATE_B_CAM env vars
+    CAM_A: int = int(os.environ.get('GATE_A_CAM', '1'))
+    CAM_B: int = int(os.environ.get('GATE_B_CAM', '2'))
+
+    def __init__(self) -> None:
+        self.running:       bool = False
+        self._thread:       'threading.Thread | None' = None
+
+        # Per-gate annotated JPEG buffers + their locks
+        self._locks:        dict = {k: threading.Lock() for k in _GATE_KEYS}
+        self._bufs:         dict = {k: _make_placeholder('STARTING...') for k in _GATE_KEYS}
+
+        # Status info read by /api/stream-status
+        self.status:        dict = {
+            k: {'online': False, 'fps': 0.0, 'last_plate': '', 'alert': ''}
+            for k in _GATE_KEYS
+        }
+
+        # Loaded lazily in _run(); None until models are available
+        self._plate_model   = None
+        self._char_model    = None
+        self.models_loaded: bool = False
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start the background processing thread (idempotent)."""
+        if self.running:
+            return
+        self.running  = True
+        self._thread  = threading.Thread(target=self._run, daemon=True, name='vlpr-stream')
+        self._thread.start()
+        print('📹  VideoStreamManager started (background thread)')
+
+    def stop(self) -> None:
+        self.running = False
+
+    def get_jpeg(self, gate_key: str) -> bytes:
+        """Return the latest JPEG bytes for the given gate (thread-safe)."""
+        with self._locks.get(gate_key, threading.Lock()):
+            return self._bufs.get(gate_key, _make_placeholder())
+
+    # ── Internal: model loading ───────────────────────────────────────────────
+
+    def _load_models(self) -> bool:
+        """
+        Attempt to load YOLOv8 models. Returns True on success.
+        On failure, sets models_loaded=False and continues with raw feed.
+        """
+        try:
+            from ultralytics import YOLO as _YOLO
+            script_dir  = os.path.dirname(os.path.abspath(__file__))
+            models_dir  = os.path.join(script_dir, 'models')
+            plate_path  = os.path.join(models_dir, 'plate_detection.pt')
+            char_path   = os.path.join(models_dir, 'character_recognition.pt')
+
+            if not (os.path.exists(plate_path) and os.path.exists(char_path)):
+                print('⚠️  Stream: model .pt files not found — streaming raw feed.')
+                return False
+
+            self._plate_model = _YOLO(plate_path)
+            self._char_model  = _YOLO(char_path)
+            print('✅  Stream: YOLOv8 models loaded.')
+            return True
+        except Exception as e:
+            print(f'⚠️  Stream: model load failed ({e}) — streaming raw feed.')
+            return False
+
+    # ── Internal: main loop ───────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        """
+        Background daemon thread: open cameras, run pipeline, push frames.
+
+        Mirrors the research_demo.py sequential per-gate loop exactly.
+        Exits cleanly on self.running = False.
+        """
+        from src.tracker   import PlateTracker
+        from src.validator import SriLankanPlateValidator, is_reasonable_plate_text
+        from src.spatial   import SpatialVerifier
+        from src.utils     import enhance_plate_contrast
+
+        self.models_loaded = self._load_models()
+
+        # Open cameras — fall back to index 0 if configured index fails
+        def _open(idx: int) -> '_cv2.VideoCapture':
+            cap = _cv2.VideoCapture(idx)
+            if not cap.isOpened():
+                cap = _cv2.VideoCapture(0)
+            cap.set(_cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap
+
+        caps       = [_open(self.CAM_A), _open(self.CAM_B)]
+        trackers   = [PlateTracker(min_hits=1, iou_threshold=0.3) for _ in _GATE_KEYS]
+        validator  = SriLankanPlateValidator()
+        spatial    = SpatialVerifier({
+            ('GATE A', 'GATE B'): 5,
+            ('GATE B', 'GATE A'): 5,
+        })
+
+        # FPS tracking
+        frame_times: dict = {k: [] for k in _GATE_KEYS}
+
+        try:
+            while self.running:
+                loop_start = time.time()
+
+                for i, (gate_key, gate_id) in enumerate(zip(_GATE_KEYS, _GATE_NAMES)):
+                    t0 = time.time()
+                    cap = caps[i]
+                    ret, frame = cap.read()
+
+                    if not ret or frame is None:
+                        self._push(_make_placeholder(), gate_key)
+                        self.status[gate_key]['online'] = False
+                        continue
+
+                    frame = _cv2.resize(frame, (640, 480))
+                    self.status[gate_key]['online'] = True
+
+                    # ── Gate label overlay ────────────────────────────────────
+                    _cv2.putText(frame, gate_id, (10, 35),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 1.1, _COL_YELLOW, 2)
+
+                    if self.models_loaded:
+                        frame = self._run_pipeline(
+                            frame, gate_key, gate_id,
+                            trackers[i], validator, spatial,
+                            enhance_plate_contrast,
+                            is_reasonable_plate_text,
+                        )
+                    else:
+                        _cv2.putText(frame, 'MODELS NOT LOADED', (160, 260),
+                                     _cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 100, 160), 2)
+
+                    # Timestamp overlay (bottom-right)
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    _cv2.putText(frame, ts, (540, 470),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 100, 120), 1)
+
+                    # Encode and push
+                    ok, buf = _cv2.imencode('.jpg', frame,
+                                            [_cv2.IMWRITE_JPEG_QUALITY, 82])
+                    if ok:
+                        self._push(bytes(buf), gate_key)
+
+                    # Rolling FPS
+                    elapsed = time.time() - t0
+                    ft = frame_times[gate_key]
+                    ft.append(elapsed)
+                    if len(ft) > 20:
+                        ft.pop(0)
+                    self.status[gate_key]['fps'] = round(
+                        len(ft) / max(sum(ft), 0.001), 1
+                    )
+
+                # Throttle to ~15 fps per camera to avoid CPU saturation
+                spent = time.time() - loop_start
+                sleep_time = max(0.0, (1.0 / 15) - spent)
+                time.sleep(sleep_time)
+
+        finally:
+            for cap in caps:
+                cap.release()
+            for gate_key in _GATE_KEYS:
+                self._push(_make_placeholder('OFFLINE'), gate_key)
+            print('📹  VideoStreamManager stopped.')
+
+    def _push(self, jpeg: bytes, gate_key: str) -> None:
+        """Write a new JPEG into the frame buffer (lock-protected)."""
+        with self._locks[gate_key]:
+            self._bufs[gate_key] = jpeg
+
+    def _run_pipeline(
+        self, frame, gate_key, gate_id,
+        tracker, validator, spatial,
+        enhance_plate_contrast, is_reasonable_plate_text,
+    ):
+        """
+        Run the full VLPR pipeline on a single frame and return the annotated
+        frame. This is the headless equivalent of research_demo.py's inner loop.
+
+        No cv2.imshow() — the annotated frame is returned for JPEG encoding.
+        """
+        plate_res  = self._plate_model.predict(frame, conf=0.4, verbose=False)[0]
+        detections = []
+
+        if len(plate_res.boxes) > 0:
+            for j, box in enumerate(plate_res.boxes.xyxy):
+                x1, y1, x2, y2 = box.cpu().numpy().astype(int)
+                h, w = frame.shape[:2]
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(w, x2); y2 = min(h, y2)
+                plate_crop = frame[y1:y2, x1:x2]
+                if plate_crop.size == 0:
+                    continue
+
+                plate_text = ''
+                try:
+                    enhanced   = enhance_plate_contrast(plate_crop)
+                    char_res   = self._char_model.predict(enhanced, conf=0.4, verbose=False)[0]
+                    if char_res.boxes:
+                        chars = []
+                        for cb in char_res.boxes:
+                            cls_id   = int(cb.cls[0])
+                            x_center = float(cb.xywh[0][0])
+                            ch       = validator.class_to_char.get(cls_id, '?')
+                            chars.append((x_center, ch))
+                        chars.sort(key=lambda x: x[0])
+                        plate_text = ''.join(c[1] for c in chars)
+                except Exception:
+                    pass
+
+                detections.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'text': plate_text,
+                    'confidence': float(plate_res.boxes.conf[j]),
+                    'crop': plate_crop,
+                    'is_valid': True,
+                })
+
+        tracks = tracker.update(detections)
+
+        for track_id, track in tracks.items():
+            if track['hits'] < 1:
+                continue
+            x1, y1, x2, y2 = track['bbox']
+            p_text          = track['consensus_text']
+            box_color       = _COL_ORANGE
+            status_msg      = ''
+
+            if is_reasonable_plate_text(p_text):
+                is_valid, reason = spatial.check_entry(p_text, gate_id)
+                self.status[gate_key]['last_plate'] = p_text
+
+                if is_valid:
+                    box_color  = _COL_GREEN
+                    status_msg = 'OK'
+                    self.status[gate_key]['alert'] = ''
+                else:
+                    box_color  = _COL_RED
+                    status_msg = 'FRAUD'
+                    alert_label = reason.split(':')[0]
+                    self.status[gate_key]['alert'] = alert_label
+
+                    # Fraud banner
+                    _cv2.rectangle(frame, (0, 435), (640, 480), (0, 0, 160), -1)
+                    _cv2.putText(frame, f'ALERT: {alert_label}', (8, 464),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.7, _COL_WHITE, 2)
+
+                    # Log to DB (non-blocking — lock is held in insert_plate_detection)
+                    try:
+                        alert = spatial.get_latest_fraud_alert()
+                        if alert:
+                            get_db().log_fraud_event(alert)
+                    except Exception:
+                        pass
+
+            _cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+            label = f'{p_text} [{status_msg}]' if status_msg else p_text
+            _cv2.putText(frame, label, (x1, max(y1 - 10, 14)),
+                         _cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+
+        return frame
+
+
+# Global singleton — created once, started lazily
+_stream_manager: 'VideoStreamManager | None' = None
+
+def get_stream() -> VideoStreamManager:
+    global _stream_manager
+    if _stream_manager is None:
+        _stream_manager = VideoStreamManager()
+    return _stream_manager
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auth Decorators
@@ -439,6 +762,11 @@ a{color:var(--accent);text-decoration:none}
     {% if 'fraud_feed' in permissions %}
     <a href="/fraud-feed" class="nav-item {% if active_page=='fraud_feed' %}active{% endif %}">
       <span class="nav-icon">🚨</span> Fraud Intelligence
+    </a>
+    {% endif %}
+    {% if 'cctv' in permissions %}
+    <a href="/control-room" class="nav-item {% if active_page=='cctv' %}active{% endif %}">
+      <span class="nav-icon">📹</span> Control Room
     </a>
     {% endif %}
     {% if 'access_log' in permissions %}
@@ -1205,6 +1533,185 @@ NOT_FOUND_HTML = """{% extends "base.html" %}
 </div>
 {% endblock %}"""
 
+
+CCTV_HTML = """{% extends "base.html" %}
+{% block topbar_title %}Control Room — Live CCTV{% endblock %}
+{% block extra_style %}
+<style>
+.feed-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.feed-panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.feed-header{
+  padding:11px 16px;background:var(--panel2);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+}
+.feed-header .feed-title{font-family:var(--font-hd);font-size:15px;font-weight:600;letter-spacing:.04em}
+.feed-status{display:flex;align-items:center;gap:8px}
+.dot-live{width:8px;height:8px;border-radius:50%;background:var(--success);
+  box-shadow:0 0 6px var(--success);animation:pulse 2s infinite}
+.dot-offline{width:8px;height:8px;border-radius:50%;background:var(--text3)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.feed-img-wrap{position:relative;background:#000;line-height:0}
+.feed-img-wrap img{width:100%;display:block;height:auto}
+.feed-meta{
+  padding:9px 14px;display:flex;justify-content:space-between;align-items:center;
+  border-top:1px solid var(--border);
+}
+.feed-meta .plate-badge{
+  font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent);
+  background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);
+  padding:3px 10px;border-radius:5px;letter-spacing:.06em;
+}
+.feed-meta .fps-badge{font-family:var(--font-mono);font-size:11px;color:var(--text3)}
+.alert-bar{
+  background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);
+  border-radius:5px;padding:7px 12px;font-size:12px;font-family:var(--font-mono);
+  color:var(--critical);display:flex;align-items:center;gap:8px;
+  animation:alertPulse 1.5s ease infinite;margin:0 14px 12px;
+}
+@keyframes alertPulse{0%,100%{background:rgba(239,68,68,.15)}50%{background:rgba(239,68,68,.28)}}
+
+.ticker-panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.ticker-header{padding:13px 20px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between}
+.ticker-body{max-height:240px;overflow-y:auto}
+.ticker-row{
+  display:grid;grid-template-columns:160px 110px 1fr 110px;gap:12px;
+  padding:10px 18px;border-bottom:1px solid rgba(26,51,86,.4);align-items:center;
+}
+.ticker-row:last-child{border-bottom:none}
+.ticker-row:hover{background:var(--panel2)}
+.no-events{padding:24px;text-align:center;color:var(--text2);font-size:13px}
+
+.model-notice{
+  grid-column:1/-1;background:rgba(14,165,233,.08);border:1px solid rgba(14,165,233,.25);
+  border-radius:8px;padding:14px 18px;margin-bottom:16px;
+  font-size:13px;color:var(--accent2);display:flex;align-items:center;gap:10px;
+}
+</style>
+{% endblock %}
+{% block content %}
+<div id="model-notice" class="model-notice" style="display:none">
+  ℹ Models not found — cameras stream raw feed only. Place <code>plate_detection.pt</code>
+  and <code>character_recognition.pt</code> in the <code>models/</code> directory and restart.
+</div>
+
+<div class="feed-grid">
+  <!-- Gate A -->
+  <div class="feed-panel">
+    <div class="feed-header">
+      <span class="feed-title">📷 Gate A</span>
+      <div class="feed-status">
+        <span id="dot-a" class="dot-offline"></span>
+        <span id="label-a" style="font-family:var(--font-mono);font-size:11px;color:var(--text2)">Connecting…</span>
+      </div>
+    </div>
+    <div class="feed-img-wrap">
+      <img id="feed-a" src="/stream/gate_a" alt="Gate A Feed"
+           onerror="this.src='/stream/gate_a'" loading="lazy">
+    </div>
+    <div id="alert-a"></div>
+    <div class="feed-meta">
+      <span class="plate-badge" id="plate-a">— — —</span>
+      <span class="fps-badge" id="fps-a">— fps</span>
+    </div>
+  </div>
+
+  <!-- Gate B -->
+  <div class="feed-panel">
+    <div class="feed-header">
+      <span class="feed-title">📷 Gate B</span>
+      <div class="feed-status">
+        <span id="dot-b" class="dot-offline"></span>
+        <span id="label-b" style="font-family:var(--font-mono);font-size:11px;color:var(--text2)">Connecting…</span>
+      </div>
+    </div>
+    <div class="feed-img-wrap">
+      <img id="feed-b" src="/stream/gate_b" alt="Gate B Feed"
+           onerror="this.src='/stream/gate_b'" loading="lazy">
+    </div>
+    <div id="alert-b"></div>
+    <div class="feed-meta">
+      <span class="plate-badge" id="plate-b">— — —</span>
+      <span class="fps-badge" id="fps-b">— fps</span>
+    </div>
+  </div>
+</div>
+
+<!-- Live Fraud Event Ticker -->
+<div class="ticker-panel">
+  <div class="ticker-header">
+    <span style="font-family:var(--font-hd);font-size:15px;font-weight:600">🚨 Live Fraud Event Ticker</span>
+    <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2)" id="ticker-ts">Polling every 5s</span>
+  </div>
+  <div class="ticker-body">
+    <div style="display:grid;grid-template-columns:160px 110px 1fr 110px;gap:12px;
+                padding:8px 18px;background:var(--panel2);border-bottom:1px solid var(--border)">
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.08em">Timestamp</span>
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.08em">Plate</span>
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.08em">Violation</span>
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.08em">Severity</span>
+    </div>
+    <div id="ticker-rows"><div class="no-events">No fraud events yet — system monitoring…</div></div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+// Stream status polling
+function updateStatus(){
+  api('/api/stream-status').then(d=>{
+    if(!d) return;
+    ['a','b'].forEach((k,i)=>{
+      const gate = i===0 ? 'gate_a' : 'gate_b';
+      const s = d[gate];
+      if(!s) return;
+      const dot   = document.getElementById('dot-'+k);
+      const lbl   = document.getElementById('label-'+k);
+      const plate = document.getElementById('plate-'+k);
+      const fps   = document.getElementById('fps-'+k);
+      const alertDiv = document.getElementById('alert-'+k);
+      dot.className   = s.online ? 'dot-live' : 'dot-offline';
+      lbl.textContent = s.online ? 'LIVE' : 'OFFLINE';
+      plate.textContent = s.last_plate || '— — —';
+      fps.textContent   = s.fps ? s.fps+' fps' : '— fps';
+      if(s.alert){
+        alertDiv.innerHTML=`<div class="alert-bar">⚠ FRAUD DETECTED — ${s.alert}</div>`;
+      } else {
+        alertDiv.innerHTML='';
+      }
+      if(!s.models_loaded){
+        document.getElementById('model-notice').style.display='flex';
+      }
+    });
+  });
+}
+
+// Fraud event ticker
+function updateTicker(){
+  api('/api/fraud-events?limit=10').then(d=>{
+    const wrap = document.getElementById('ticker-rows');
+    if(!d||!d.rows||!d.rows.length){
+      wrap.innerHTML='<div class="no-events">No fraud events yet — system monitoring…</div>';
+      return;
+    }
+    document.getElementById('ticker-ts').textContent='Updated '+new Date().toLocaleTimeString('en-GB',{hour12:false});
+    wrap.innerHTML=d.rows.map(r=>`<div class="ticker-row">
+      <span style="font-family:var(--font-mono);font-size:12px;color:var(--text2)">${r.timestamp}</span>
+      <span style="font-family:var(--font-mono);font-size:13px;color:var(--accent);font-weight:600">${r.plate_number}</span>
+      <span class="violation-${r.violation_type}" style="font-size:12px">${(r.violation_type||'').replace(/_/g,' ')}</span>
+      <span class="badge-sev badge-${r.severity_level}">⬤ ${r.severity_level}</span>
+    </div>`).join('');
+  });
+}
+
+updateStatus();
+updateTicker();
+setInterval(updateStatus, 2000);
+setInterval(updateTicker, 5000);
+</script>
+{% endblock %}
+"""
+
 TEMPLATES = {
     'base.html':        BASE_HTML,
     'login.html':       LOGIN_HTML,
@@ -1217,6 +1724,7 @@ TEMPLATES = {
     'users.html':       USERS_HTML,
     'forbidden.html':   FORBIDDEN_HTML,
     '404.html':         NOT_FOUND_HTML,
+    'cctv.html':        CCTV_HTML,
 }
 app.jinja_loader = __import__('jinja2').DictLoader(TEMPLATES)
 
@@ -1508,6 +2016,73 @@ def api_export_csv():
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+@app.route('/control-room')
+@role_required('admin', 'security')
+def control_room():
+    return render_page('cctv.html', {})
+
+
+def _mjpeg_generator(gate_key: str):
+    """
+    MJPEG frame generator for Flask streaming response.
+
+    Pulls the latest JPEG from the VideoStreamManager frame buffer and
+    yields it wrapped in the multipart/x-mixed-replace boundary protocol.
+    The sleep(1/25) cap limits the browser to ~25 fps, preventing a
+    fast client from saturating the CPU with buffer reads.
+
+    If the stream manager is not running (e.g. first request), it is
+    started lazily here so the CV thread only spins up when the Control
+    Room page is actually opened.
+    """
+    mgr = get_stream()
+    if not mgr.running:
+        mgr.start()
+
+    while True:
+        jpeg = mgr.get_jpeg(gate_key)
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n'
+            + jpeg +
+            b'\r\n'
+        )
+        time.sleep(1.0 / 25)  # 25 fps ceiling
+
+
+@app.route('/stream/<gate_key>')
+@login_required
+def stream_feed(gate_key: str):
+    """
+    MJPEG streaming endpoint.
+
+    gate_key must be 'gate_a' or 'gate_b'. Returns a streaming response
+    using the multipart/x-mixed-replace MIME type — this is the standard
+    MJPEG-over-HTTP protocol supported natively by all major browsers
+    via a plain <img src="..."> tag.
+    """
+    if gate_key not in ('gate_a', 'gate_b'):
+        return Response(status=404)
+    return Response(
+        _mjpeg_generator(gate_key),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+    )
+
+
+@app.route('/api/stream-status')
+@login_required
+def api_stream_status():
+    """Return current stream status for both gates (FPS, last plate, alert)."""
+    mgr = get_stream()
+    payload = {}
+    for k in ('gate_a', 'gate_b'):
+        s = dict(mgr.status.get(k, {}))
+        s['models_loaded'] = mgr.models_loaded
+        payload[k] = s
+    return jsonify(payload)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='VLPR Security Dashboard')
     parser.add_argument('--db',   default=DEFAULT_SQLITE_PATH,
@@ -1527,4 +2102,4 @@ if __name__ == '__main__':
     print(f"  Roles    : admin / security / finance")
     print(f"{'='*60}\n")
 
-    app.run(host=args.host, port=args.port, debug=False)
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)

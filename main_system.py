@@ -2,6 +2,13 @@
 main_system.py
 Production Pipeline — Full Dockyard RTSP Deployment
 
+Sprint 5 Additions (POC Decoupling):
+  - REST API dependency removed. DatabaseManager no longer accepts base_url,
+    cam_code, device, or in_out parameters (Sprint 5 database.py rewrite).
+  - CONFIG keys API_BASE_URL, DEVICE, IN_OUT removed.
+  - insert_plate_detection() calls no longer pass sync= parameter.
+  - System is now fully offline — all persistence is local SQLite only.
+
 Sprint 3 Additions:
   - CLAHE preprocessing wired into the character recognition pipeline.
     enhance_plate_contrast() from src/utils.py is now called on every plate
@@ -106,9 +113,7 @@ CONFIG: dict = {
     'SAVE_DETECTIONS':             True,
     'SHOW_INDIVIDUAL_PLATES':      True,
     'DATABASE_ENABLED':            True,
-    'API_BASE_URL':                "https://esystems.cdl.lk/backend-Test/NPRCamera/RFID",
-    'DEVICE':                      '01',
-    'IN_OUT':                      'I',
+    # Sprint 5: API_BASE_URL, DEVICE, IN_OUT removed (POC — fully offline).
     'DB_ASYNC_MODE':               True,
     'MIN_CONFIDENCE_FOR_DB':       0.75,
     'MIN_HITS_FOR_DB':             40,
@@ -165,9 +170,7 @@ class CameraStream:
 
     def __init__(self, source: str) -> None:
         self.source  = source
-        # Integer index required for local webcams; keep string for URLs/paths.
-        _cap_source  = int(source) if source.lstrip('-').isdigit() else source
-        self.cap     = cv2.VideoCapture(_cap_source, cv2.CAP_MSMF)
+        self.cap     = cv2.VideoCapture(source)
 
         if source.startswith(('rtsp://', 'http://')):
             # Minimise OS-level buffer depth — we only ever want the latest frame.
@@ -265,8 +268,7 @@ def run_enhanced_plate_detection() -> None:
     if CONFIG.get('DATABASE_ENABLED'):
         print(
             f"  🗄️  Database:     ENABLED | "
-            f"Camera: {CONFIG['DEVICE']} | "
-            f"Direction: {CONFIG['IN_OUT']}"
+            f"Mode: Local SQLite POC — fully offline"
         )
     else:
         print("  🗄️  Database:     DISABLED")
@@ -292,10 +294,7 @@ def run_enhanced_plate_detection() -> None:
     if CONFIG.get('DATABASE_ENABLED', False):
         try:
             db_manager = DatabaseManager(
-                base_url       = CONFIG['API_BASE_URL'],
-                cam_code       = CONFIG['DEVICE'],
-                device         = CONFIG['DEVICE'],
-                in_out         = CONFIG['IN_OUT'],
+                sqlite_db_path = CONFIG['SQLITE_DB_PATH'],
             )
         except Exception as e:
             print(f"⚠️  Database init failed: {e}")
@@ -572,8 +571,7 @@ def run_enhanced_plate_detection() -> None:
                             track_id,
                             gate_id=gate_id,
                             decision=decision,
-                            sync=False,
-                        )
+                            )
                         track['saved_to_db'] = bool(queued)
                     else:
                         success = db_manager.insert_plate_detection(
@@ -581,8 +579,7 @@ def run_enhanced_plate_detection() -> None:
                             track_id,
                             gate_id=gate_id,
                             decision=decision,
-                            sync=True,
-                        )
+                            )
                         track['saved_to_db'] = bool(success)
                 else:
                     track['saved_to_db'] = True
@@ -640,15 +637,6 @@ def run_enhanced_plate_detection() -> None:
 
 
 if __name__ == "__main__":
-    import argparse as _ap
-    _parser = _ap.ArgumentParser(description="VLPR Production Pipeline")
-    _parser.add_argument("--source",    default=None,  help="Camera index (1/2) or RTSP URL")
-    _parser.add_argument("--device",    default=None,  help="Camera ID logged to DB (e.g. 01, 02)")
-    _parser.add_argument("--direction", default=None,  choices=["I", "O"], help="I=entry O=exit")
-    _args = _parser.parse_args()
-
-    if _args.source    is not None: CONFIG['VIDEO_SOURCE'] = _args.source
-    if _args.device    is not None: CONFIG['DEVICE']       = _args.device
-    if _args.direction is not None: CONFIG['IN_OUT']       = _args.direction
-
+    if len(sys.argv) > 1:
+        CONFIG['VIDEO_SOURCE'] = sys.argv[1]
     run_enhanced_plate_detection()
